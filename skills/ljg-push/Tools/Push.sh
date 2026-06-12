@@ -98,23 +98,79 @@ bump_version() {
   echo "$new"
 }
 
+# Convert one org file to a markdown sibling.
+#   - Leading #+key: header block → YAML frontmatter (--- fenced, filetags → tags)
+#   - Headings: * → #, ** → ## (level-preserving)
+#   - #+ATTR_* lines dropped; #+begin_src/#+end_src → ``` fences
+#   - [[file:path]] → ![](path)
+orgfile_to_md() {
+  local src="$1" dst="$2"
+  awk '
+    BEGIN { inhdr = -1 }   # -1 not started, 1 inside header, 0 closed
+    /^#\+[A-Za-z_]+:/ && inhdr != 0 {
+      if (inhdr == -1) { print "---"; inhdr = 1 }
+      line = $0
+      sub(/^#\+/, "", line)
+      key = line; sub(/:.*/, "", key); key = tolower(key)
+      val = line; sub(/^[A-Za-z_]+:[ \t]*/, "", val)
+      if (key == "filetags") {
+        gsub(/:/, " ", val); gsub(/^[ \t]+|[ \t]+$/, "", val)
+        printf "tags: %s\n", val
+      } else {
+        printf "%s: %s\n", key, val
+      }
+      next
+    }
+    { if (inhdr == 1) { print "---"; inhdr = 0 } }
+    /^#\+ATTR/ { next }
+    /^#\+begin_src/ { sub(/^#\+begin_src[ \t]*/, "```"); print; next }
+    /^#\+end_src/ { print "```"; next }
+    /^#\+begin_quote/ { next }
+    /^#\+end_quote/ { next }
+    /^\*+ / {
+      n = 0; while (substr($0, n + 1, 1) == "*") n++
+      hashes = ""; for (i = 0; i < n; i++) hashes = hashes "#"
+      print hashes substr($0, n + 1)
+      next
+    }
+    {
+      line = $0
+      while (match(line, /\[\[file:[^]]+\]\]/)) {
+        path = substr(line, RSTART + 7, RLENGTH - 9)
+        line = substr(line, 1, RSTART - 1) "![](" path ")" substr(line, RSTART + RLENGTH)
+      }
+      print line
+    }
+  ' "$src" > "$dst"
+}
+
 # Apply markdown-ization to a skill directory.
-# Replaces:
-#   - File-extension refs: __qa.org → __qa.md, __paper.org → __paper.md, etc.
-#   - Template refs: template.org → template.md
-#   - Keywords: org-mode → markdown
-# Does NOT replace: *bold*, org headers, file renames (manual maintenance).
+#   1. Every *.org file → converted *.md sibling (orgfile_to_md), .org removed,
+#      references to the renamed file rewritten across all md files.
+#   2. String swaps in all *.md files (assets/ excluded):
+#      - File-extension refs: __qa.org → __qa.md, etc.
+#      - Keywords: org-mode → markdown
+#      - Org-style format instructions: *bold* rule, heading-level rule,
+#        "Org 文件头", #+title:-style example lines → YAML keys
+# Does NOT touch: *bold* markers inside prose (markdown italics ambiguity).
 mdize_skill() {
   local skill_dir="$1"
+
+  # 1) org files → md siblings
+  local orgfiles=() renames=()
+  while IFS= read -r f; do orgfiles+=("$f"); done < <(find "$skill_dir" -name '*.org' -not -path '*/assets/*' 2>/dev/null)
+  local org
+  for org in ${orgfiles[@]+"${orgfiles[@]}"}; do
+    orgfile_to_md "$org" "${org%.org}.md"
+    rm "$org"
+    renames+=("$(basename "$org")")
+  done
+
+  # 2) string swaps across all md files
   local files=()
-  [ -f "$skill_dir/SKILL.md" ] && files+=("$skill_dir/SKILL.md")
-  if [ -d "$skill_dir/Workflows" ]; then
-    while IFS= read -r f; do files+=("$f"); done < <(find "$skill_dir/Workflows" -name '*.md' 2>/dev/null)
-  fi
-  if [ -d "$skill_dir/References" ]; then
-    while IFS= read -r f; do files+=("$f"); done < <(find "$skill_dir/References" -name '*.md' 2>/dev/null)
-  fi
-  for file in "${files[@]}"; do
+  while IFS= read -r f; do files+=("$f"); done < <(find "$skill_dir" -name '*.md' -not -path '*/assets/*' 2>/dev/null)
+  local file r
+  for file in ${files[@]+"${files[@]}"}; do
     sed -i '' \
       -e 's/__qa\.org/__qa.md/g' \
       -e 's/__paper\.org/__paper.md/g' \
@@ -125,7 +181,16 @@ mdize_skill() {
       -e 's/template\.org/template.md/g' \
       -e 's/org-mode/markdown/g' \
       -e 's/Org-mode/Markdown/g' \
+      -e 's/加粗用 `\*bold\*`（单星号），禁止 `\*\*bold\*\*`/加粗用 `**bold**`（双星号）/g' \
+      -e 's/标题层级从 `\*` 开始/标题层级从 `#` 开始/g' \
+      -e 's/Org 文件头/Markdown 文件头/g' \
       "$file"
+    sed -E -i '' \
+      -e 's/^#\+(title|subtitle|date|filetags|identifier|source|authors|venue):/\1:/' \
+      "$file"
+    for r in ${renames[@]+"${renames[@]}"}; do
+      sed -i '' "s/${r//./\\.}/${r%.org}.md/g" "$file"
+    done
   done
 }
 
